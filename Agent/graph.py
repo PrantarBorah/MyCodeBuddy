@@ -5,9 +5,10 @@ from langchain_groq import ChatGroq
 from langchain.globals import set_debug, set_verbose
 from langgraph.prebuilt import create_react_agent
 
-from prompts import *
-from states import *
-from tools import *
+from .prompts import *
+from .states import *
+from .tools import *
+from .tools import set_event_emitter, init_project_root, emit_event
 
 from langgraph.constants import END
 from langgraph.graph import StateGraph
@@ -42,14 +43,25 @@ def run_structured(schema_cls, prompt: str):
 def planner_agent(state: dict) -> dict:
     user_prompt = state["user_prompt"].strip()
     print(f"Planner received: {user_prompt}")
+    
+    # Emit node start event
+    emit_event("node", {"value": "planner", "action": "start"})
 
     try:
         plan_obj = run_structured(Plan, planner_prompt(user_prompt))
         result = {"plan": plan_obj.model_dump()}
         print(f"Planner created plan: {plan_obj.name} with {len(plan_obj.files)} files")
+        
+        # Emit node end event
+        emit_event("node", {"value": "planner", "action": "end", "success": True})
+        
         return result
     except Exception as e:
         print(f"Planner error: {e}")
+        
+        # Emit node end event with error
+        emit_event("node", {"value": "planner", "action": "end", "success": False, "error": str(e)})
+        
         return {
             "plan": {"name": "Error", "description": "Failed to create plan", "tech_stack": "unknown", "features": [],
                      "files": []}}
@@ -57,8 +69,12 @@ def planner_agent(state: dict) -> dict:
 
 def architect_agent(state: dict) -> dict:
     print(f"Architect received state keys: {list(state.keys())}")
+    
+    # Emit node start event
+    emit_event("node", {"value": "architect", "action": "start"})
 
     if "plan" not in state:
+        emit_event("node", {"value": "architect", "action": "end", "success": False, "error": "No plan found"})
         return {"task_plan": {"implementation_steps": []}}
 
     plan = Plan(**state["plan"]) if isinstance(state["plan"], dict) else state["plan"]
@@ -69,9 +85,17 @@ def architect_agent(state: dict) -> dict:
         out = task_plan_obj.model_dump()
         out["plan"] = plan.model_dump() if hasattr(plan, "model_dump") else plan
         print(f"Architect created task_plan with {len(task_plan_obj.implementation_steps)} steps")
+        
+        # Emit node end event
+        emit_event("node", {"value": "architect", "action": "end", "success": True, "steps": len(task_plan_obj.implementation_steps)})
+        
         return {"task_plan": out}
     except Exception as e:
         print(f"Architect error: {e}")
+        
+        # Emit node end event with error
+        emit_event("node", {"value": "architect", "action": "end", "success": False, "error": str(e)})
+        
         return {"task_plan": {"implementation_steps": [],
                               "plan": plan.model_dump() if hasattr(plan, "model_dump") else plan}}
 
@@ -93,6 +117,7 @@ def coder_agent(state: dict) -> dict:
         task_plan_data = state["coder_state"]["task_plan"]
     else:
         print("ERROR: No task_plan found in state")
+        emit_event("error", {"message": "No task_plan found in state"})
         return {"coder_state": {"current_step_idx": 999, "task_plan": {"implementation_steps": []}}}
 
     # coder_state reconstruction properly
@@ -102,6 +127,9 @@ def coder_agent(state: dict) -> dict:
         task_plan = TaskPlan(**task_plan_data) if isinstance(task_plan_data, dict) else task_plan_data
         coder_state = CoderState(task_plan=task_plan, current_step_idx=0)
         print(f"Initialized new coder_state with {len(task_plan.implementation_steps)} steps")
+        
+        # Emit coder start event
+        emit_event("node", {"value": "coder", "action": "start", "total_steps": len(task_plan.implementation_steps)})
     else:
         print(f"Reconstructing coder_state from: {coder_state_data}")
         # The issue was here - we need to properly reconstruct the nested TaskPlan
@@ -129,12 +157,22 @@ def coder_agent(state: dict) -> dict:
     # Check if we're done with all steps
     if coder_state.current_step_idx >= len(steps):
         print("All implementation steps completed!")
+        emit_event("node", {"value": "coder", "action": "end", "success": True, "completed_steps": len(steps)})
+        emit_event("done", {"message": "All steps completed successfully"})
         return {"coder_state": coder_state.model_dump()}
 
     # Get current task
     current_task = steps[coder_state.current_step_idx]
     print(f"Processing step {coder_state.current_step_idx + 1}/{len(steps)}: {current_task.task_description}")
     print(f"Target file: {current_task.filepath}")
+    
+    # Emit step start event
+    emit_event("step", {
+        "step_index": coder_state.current_step_idx,
+        "total_steps": len(steps),
+        "filepath": current_task.filepath,
+        "description": current_task.task_description
+    })
 
     # TEST: Try writing a simple test file to verify write_file works
     try:
@@ -256,6 +294,14 @@ def coder_agent(state: dict) -> dict:
     coder_state.current_step_idx += 1
     print(f"Incremented step index to: {coder_state.current_step_idx}")
     print(f"Total steps: {len(steps)}")
+    
+    # Emit step completion event
+    emit_event("step_complete", {
+        "step_index": coder_state.current_step_idx - 1,
+        "total_steps": len(steps),
+        "filepath": current_task.filepath,
+        "success": True
+    })
 
     # Return the updated coder_state
     result = {"coder_state": coder_state.model_dump()}
@@ -309,15 +355,33 @@ graph.set_entry_point("planner")
 
 agent = graph.compile()
 
+def create_session_agent(session_id: str, event_emitter=None):
+    """Create an agent instance for a specific session with event emission."""
+    # Set up event emitter and session context
+    if event_emitter:
+        set_event_emitter(event_emitter, session_id)
+    
+    # Initialize project root for this session
+    project_path = init_project_root(session_id)
+    print(f"Project root initialized for session {session_id} at: {project_path}")
+    
+    # Return the compiled agent (same graph, but tools will use session context)
+    return agent
+
 if __name__ == "__main__":
-    # Initialize the project directory
-    from tools import init_project_root
-
-    project_path = init_project_root()
-    print(f"Project root initialized at: {project_path}")
-
+    # Test the session-aware agent
+    import uuid
+    session_id = str(uuid.uuid4())
+    
+    # Create a simple event emitter for testing
+    def test_emitter(session_id, event):
+        print(f"[{session_id}] Event: {event}")
+    
+    # Create session agent
+    session_agent = create_session_agent(session_id, test_emitter)
+    
     user_prompt = "Create a simple To-do list Web Application"
-    result = agent.invoke({"user_prompt": user_prompt},
-                          {"recursion_limit": 100})
+    result = session_agent.invoke({"user_prompt": user_prompt},
+                                  {"recursion_limit": 100})
     print("Final result:")
     print(result)
