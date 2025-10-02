@@ -1,4 +1,4 @@
-# Code Builder — AI-Powered Coding Assistant (LangGraph)
+# MyCodeBuddy— AI-Powered Coding Assistant (LangGraph)
 
 An AI-powered coding assistant that operates like a small multi-agent development team. It takes a natural-language request ("Build a simple To‑Do app") and transforms it into a concrete engineering plan and implementation tasks, designed to generate a complete project file-by-file using real developer workflows.
 
